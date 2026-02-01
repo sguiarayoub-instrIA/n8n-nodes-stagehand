@@ -18,6 +18,46 @@ type Field = {
 	optional: boolean;
 };
 
+// Filter out messages that contain image/screenshot data entirely
+function sanitizeMessages(messages: LogLine[]): any[] {
+	return messages
+		.filter(msg => {
+			const str = JSON.stringify(msg);
+			return !str.includes('image') && !str.includes('screenshot') && str.length < 5000;
+		})
+		.map(msg => ({
+			category: msg.category,
+			message: msg.message,
+			level: msg.level,
+		}));
+}
+
+// Extract usage data from aisdk messages
+function extractUsageFromMessages(messages: LogLine[]): { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null {
+	let totalPrompt = 0;
+	let totalCompletion = 0;
+	let totalTokens = 0;
+	let found = false;
+
+	for (const msg of messages) {
+		if (msg.category === 'aisdk' && msg.auxiliary?.response?.value) {
+			try {
+				const parsed = JSON.parse(msg.auxiliary.response.value);
+				if (parsed.usage) {
+					found = true;
+					totalPrompt += parsed.usage.prompt_tokens || parsed.usage.promptTokens || 0;
+					totalCompletion += parsed.usage.completion_tokens || parsed.usage.completionTokens || 0;
+					totalTokens += parsed.usage.total_tokens || parsed.usage.totalTokens || 0;
+				}
+			} catch {
+				// Ignore parse errors
+			}
+		}
+	}
+
+	return found ? { prompt_tokens: totalPrompt, completion_tokens: totalCompletion, total_tokens: totalTokens } : null;
+}
+
 export class Stagehand implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Stagehand',
@@ -65,6 +105,12 @@ export class Stagehand implements INodeType {
 						description: 'Observe the page and plan an action',
 						action: 'Observe the page',
 					},
+					{
+						name: 'Agent',
+						value: 'agent',
+						description: 'Execute a complex multi-step task autonomously',
+						action: 'Run autonomous agent',
+					},
 				],
 				default: 'act',
 			},
@@ -78,12 +124,54 @@ export class Stagehand implements INodeType {
 				required: true,
 			},
 			{
-				displayName: 'Instruction',
-				name: 'instruction',
+				displayName: 'Page URL',
+				name: 'pageUrl',
 				type: 'string',
 				default: '',
-				description: 'Instruction for the Stagehand to perform',
+				placeholder: 'https://google.com',
+				description: 'URL to navigate to before performing the action (required for act/extract)',
+				required: false,
+			},
+			{
+				displayName: 'Instructions',
+				name: 'instructions',
+				type: 'string',
+				typeOptions: {
+					rows: 4,
+				},
+				default: '',
+				placeholder: 'Click "Accept cookies"\nType "hello" in the search box\nClick the search button',
+				description: 'Instructions for Stagehand (one per line, executed in sequence)',
 				required: true,
+			},
+			// Agent-specific options
+			{
+				displayName: 'Max Steps',
+				name: 'maxSteps',
+				type: 'number',
+				default: 10,
+				description: 'Maximum number of steps the agent can take to complete the task',
+				displayOptions: {
+					show: {
+						operation: ['agent'],
+					},
+				},
+			},
+			{
+				displayName: 'Context',
+				name: 'agentContext',
+				type: 'string',
+				typeOptions: {
+					rows: 3,
+				},
+				default: '',
+				placeholder: 'Additional context for the agent...',
+				description: 'Additional context to help the agent understand the task',
+				displayOptions: {
+					show: {
+						operation: ['agent'],
+					},
+				},
 			},
 			{
 				displayName: 'Schema Source',
@@ -301,7 +389,20 @@ export class Stagehand implements INodeType {
 			const verbose = this.getNodeParameter('options.verbose', i, 0) as 0 | 1 | 2;
 
 			const messages: LogLine[] = [];
-			const provider = model.model.includes('deepseek') ? 'deepseek' : model.lc_namespace[2];
+			// Map provider names to what Stagehand expects
+			let provider = model.lc_namespace[2];
+			if (provider === 'google_genai' || provider === 'google_vertexai') {
+				provider = 'google';
+			} else if (model.model.includes('deepseek')) {
+				provider = 'deepseek';
+			}
+
+			// Debug logging
+			console.log('[Stagehand Debug] Provider:', provider);
+			console.log('[Stagehand Debug] Model:', model.model);
+			console.log('[Stagehand Debug] Full modelName:', provider + '/' + model.model);
+			console.log('[Stagehand Debug] CDP URL:', cdpUrl);
+
 			const stagehand = new StagehandCore({
 				env: 'LOCAL',
 				enableCaching,
@@ -321,23 +422,41 @@ export class Stagehand implements INodeType {
 			});
 			await stagehand.init();
 
+			// Navigate to page URL if provided
+			const pageUrl = this.getNodeParameter('pageUrl', i, '') as string;
+			if (pageUrl) {
+				console.log('[Stagehand Debug] Navigating to:', pageUrl);
+				await stagehand.page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+				console.log('[Stagehand Debug] Navigation complete');
+			}
+
 			try {
 				switch (operation) {
 					case 'act': {
-						const instruction = this.getNodeParameter('instruction', i, '') as string;
+						const instructionsRaw = this.getNodeParameter('instructions', i, '') as string;
+						const instructions = instructionsRaw.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+
+						const actResults: any[] = [];
+						for (const instruction of instructions) {
+							console.log('[Stagehand Debug] Executing instruction:', instruction);
+							const result = await stagehand.page.act(instruction);
+							actResults.push({ instruction, result });
+						}
 
 						results.push({
 							json: {
 								operation,
-								result: await stagehand.page.act(instruction),
-								...(logMessages ? { messages } : {}),
+								results: actResults,
+								currentUrl: stagehand.page.url(),
+								...(logMessages ? { messages: sanitizeMessages(messages) } : {}),
 							},
 						});
 						break;
 					}
 
 					case 'extract': {
-						const instruction = this.getNodeParameter('instruction', i, '') as string;
+						const instructionsRaw = this.getNodeParameter('instructions', i, '') as string;
+						const instruction = instructionsRaw.split('\n')[0]?.trim() || '';
 						const schemaSource = this.getNodeParameter('schemaSource', i, 'example') as string;
 
 						let schema: z.ZodObject<any>;
@@ -378,14 +497,15 @@ export class Stagehand implements INodeType {
 									instruction,
 									schema,
 								}),
-								...(logMessages ? { messages } : {}),
+								...(logMessages ? { messages: sanitizeMessages(messages) } : {}),
 							},
 						});
 						break;
 					}
 
 					case 'observe': {
-						const instruction = this.getNodeParameter('instruction', i, '') as string;
+						const instructionsRaw = this.getNodeParameter('instructions', i, '') as string;
+						const instruction = instructionsRaw.split('\n')[0]?.trim() || '';
 
 						results.push({
 							json: {
@@ -393,7 +513,49 @@ export class Stagehand implements INodeType {
 								result: await stagehand.page.observe({
 									instruction,
 								}),
-								...(logMessages ? { messages } : {}),
+								...(logMessages ? { messages: sanitizeMessages(messages) } : {}),
+							},
+						});
+						break;
+					}
+
+					case 'agent': {
+						const instructionsRaw = this.getNodeParameter('instructions', i, '') as string;
+						const instruction = instructionsRaw.trim();
+						const maxSteps = this.getNodeParameter('maxSteps', i, 10) as number;
+						const agentContext = this.getNodeParameter('agentContext', i, '') as string;
+
+						// Create agent and execute
+						const agent = stagehand.agent();
+						const agentResult = await agent.execute({
+							instruction,
+							maxSteps,
+							autoScreenshot: true,
+							...(agentContext ? { context: agentContext } : {}),
+						});
+
+						// Extract usage from aisdk messages (contains token counts)
+						const usage = extractUsageFromMessages(messages);
+
+						// Simplify actions for cleaner output
+						const simplifiedActions = agentResult.actions.map((action: any) => ({
+							type: action.type,
+							reasoning: action.reasoning,
+							parameters: action.parameters,
+							taskCompleted: action.taskCompleted,
+						}));
+
+						results.push({
+							json: {
+								operation,
+								success: agentResult.success,
+								message: agentResult.message,
+								completed: agentResult.completed,
+								actions: simplifiedActions,
+								actionCount: agentResult.actions.length,
+								usage,
+								currentUrl: stagehand.page.url(),
+								...(logMessages ? { messages: sanitizeMessages(messages) } : {}),
 							},
 						});
 						break;
@@ -410,7 +572,7 @@ export class Stagehand implements INodeType {
 					}),
 					json: {
 						operation,
-						...(logMessages ? { messages } : {}),
+						...(logMessages ? { messages: sanitizeMessages(messages) } : {}),
 					},
 				});
 			} finally {
